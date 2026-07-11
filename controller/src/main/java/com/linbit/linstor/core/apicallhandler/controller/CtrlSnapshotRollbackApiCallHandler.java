@@ -813,6 +813,8 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
         ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscName, true);
         unmarkDownPrivileged(rscDfn);
 
+        ctrlTransactionHelper.commit();
+
         return ctrlSatelliteUpdateCaller.updateSatellites(rscDfn, Flux.empty())
             .transform(responses -> CtrlResponseUtils.combineResponses(
                 errorReporter,

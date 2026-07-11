@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed drbd-proxy disable not releasing the target-side proxy TCP port, leaving it permanently allocated in the resource connection and the target node's port pool
 - Fixed resource-connection DRBD Proxy ports not being re-reserved in the node TCP port pools on controller startup, so a restart could hand out a port still in use by DRBD Proxy
 - Fixed the failure path of DRBD port assignment leaving previously reserved ports unreserved in the pool
+- Fixed the resource definition staying marked as down on the controller after a successful snapshot rollback using the ZFS rollback strategy (the cleared flag was never committed)
 
 ## [1.34.1] - 2026-07-09
 

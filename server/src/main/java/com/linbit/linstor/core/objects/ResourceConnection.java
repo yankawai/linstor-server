@@ -303,25 +303,26 @@ public class ResourceConnection extends AbsCoreObj<ResourceConnection>
     public @Nullable TcpPortNumber setDrbdProxyPortSource(AccessContext accCtx, @Nullable TcpPortNumber portNr)
         throws DatabaseException, AccessDeniedException, ValueInUseException
     {
-        return setDrbdProxyPortImpl(accCtx, portNr, source);
+        return setDrbdProxyPortImpl(accCtx, portNr, drbdProxyPortSource, source);
     }
 
     public @Nullable TcpPortNumber setDrbdProxyPortTarget(AccessContext accCtx, @Nullable TcpPortNumber portNr)
         throws DatabaseException, AccessDeniedException, ValueInUseException
     {
-        return setDrbdProxyPortImpl(accCtx, portNr, target);
+        return setDrbdProxyPortImpl(accCtx, portNr, drbdProxyPortTarget, target);
     }
 
     private @Nullable TcpPortNumber setDrbdProxyPortImpl(
         AccessContext accCtx,
         @Nullable TcpPortNumber portNr,
+        TransactionSimpleObject<ResourceConnection, TcpPortNumber> drbdProxyPortFieldRef,
         Resource rsc
     )
         throws DatabaseException, ValueInUseException, AccessDeniedException
     {
         requireAccess(accCtx, AccessType.USE);
         DynamicNumberPool pool = rsc.getNode().getTcpPortPool(accCtx);
-        @Nullable TcpPortNumber tcpPortNumber = drbdProxyPortSource.get();
+        @Nullable TcpPortNumber tcpPortNumber = drbdProxyPortFieldRef.get();
         if (tcpPortNumber != null)
         {
             pool.deallocate(tcpPortNumber.value);
@@ -330,7 +331,7 @@ public class ResourceConnection extends AbsCoreObj<ResourceConnection>
         {
             pool.allocate(portNr.value);
         }
-        return drbdProxyPortSource.set(portNr);
+        return drbdProxyPortFieldRef.set(portNr);
     }
 
     public void autoAllocateDrbdProxyPortSource(AccessContext accCtx)

@@ -2,21 +2,24 @@ package com.linbit.linstor.numberpool;
 
 import com.linbit.ImplementationError;
 import com.linbit.ValueInUseException;
+import com.linbit.linstor.annotation.Nullable;
 import com.linbit.linstor.annotation.SystemContext;
 import com.linbit.linstor.core.CoreModule;
 import com.linbit.linstor.core.objects.NetInterface;
 import com.linbit.linstor.core.objects.Node;
 import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceConnection;
 import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.types.TcpPortNumber;
 import com.linbit.linstor.logging.ErrorReporter;
 import com.linbit.linstor.security.AccessContext;
 import com.linbit.linstor.security.AccessDeniedException;
 import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
 import com.linbit.linstor.systemstarter.StartupInitializer;
 
+import static com.linbit.linstor.numberpool.NumberPoolModule.BACKUP_SHIPPING_PORT_POOL;
 import static com.linbit.linstor.numberpool.NumberPoolModule.LAYER_RSC_ID_POOL;
 import static com.linbit.linstor.numberpool.NumberPoolModule.MINOR_NUMBER_POOL;
-import static com.linbit.linstor.numberpool.NumberPoolModule.BACKUP_SHIPPING_PORT_POOL;
 import static com.linbit.linstor.numberpool.NumberPoolModule.SPECIAL_SATELLTE_PORT_POOL;
 
 import javax.inject.Inject;
@@ -76,11 +79,48 @@ public class DbNumberPoolInitializer implements StartupInitializer
             for (Node node : nodesMap.values())
             {
                 node.getTcpPortPool(initCtx).reloadRange();
+                allocateDrbdProxyPorts(node);
             }
         }
         catch (AccessDeniedException exc)
         {
             throw new ImplementationError(exc);
+        }
+    }
+
+    // DrbdRscData ports get allocated during DB load, resource-connection proxy ports do not - do it here
+    private void allocateDrbdProxyPorts(Node node) throws AccessDeniedException
+    {
+        DynamicNumberPool tcpPortPool = node.getTcpPortPool(initCtx);
+        Iterator<Resource> rscIt = node.iterateResources(initCtx);
+        while (rscIt.hasNext())
+        {
+            Resource rsc = rscIt.next();
+            for (ResourceConnection rscConn : rsc.getAbsResourceConnections(initCtx))
+            {
+                @Nullable TcpPortNumber port;
+                if (rsc.equals(rscConn.getSourceResource(initCtx)))
+                {
+                    port = rscConn.getDrbdProxyPortSource(initCtx);
+                }
+                else
+                {
+                    port = rscConn.getDrbdProxyPortTarget(initCtx);
+                }
+                if (port != null)
+                {
+                    try
+                    {
+                        tcpPortPool.allocate(port.value);
+                    }
+                    catch (ValueInUseException exc)
+                    {
+                        errorReporter.logError(
+                            "Skipping initial allocation in pool: " + exc.getMessage()
+                        );
+                    }
+                }
+            }
         }
     }
 

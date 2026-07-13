@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a changed DRBD auto verify algorithm not being deployed to already connected satellites when recomputed after a node full-sync, leaving nodes with different `verify-alg` settings and forcing their DRBD connections into StandAlone
+
 ## [1.34.1] - 2026-07-09
 
 ### Added

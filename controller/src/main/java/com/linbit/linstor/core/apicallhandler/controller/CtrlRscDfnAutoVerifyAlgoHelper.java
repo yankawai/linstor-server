@@ -68,7 +68,15 @@ public class CtrlRscDfnAutoVerifyAlgoHelper implements CtrlRscAutoHelper.AutoHel
     public void manage(CtrlRscAutoHelper.AutoHelperContext ctx)
     {
         ctx.responses.addEntries(checkVerifyAlgorithm(ctx.rscDfn));
-        ctx.responses.addEntries(updateVerifyAlgorithm(ctx.rscDfn).objA);
+        PairNonNull<ApiCallRc, Set<Resource>> result = updateVerifyAlgorithm(ctx.rscDfn);
+        ctx.responses.addEntries(result.objA);
+        if (!result.objB.isEmpty())
+        {
+            // the verify-alg prop changed, so all already deployed nodes need an updated .res file, otherwise
+            // only satellites that happen to receive an update for other reasons would apply the new algorithm,
+            // leaving the DRBD connections between updated and not updated nodes in StandAlone
+            ctx.requiresUpdateFlux = true;
+        }
     }
 
     private Map<String, List<ProcCryptoEntry>> getCryptoEntryMap(ResourceDefinition rscDfn)

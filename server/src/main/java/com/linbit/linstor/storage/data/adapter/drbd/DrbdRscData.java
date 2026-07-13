@@ -346,9 +346,10 @@ public class DrbdRscData<RSC extends AbsResource<RSC>>
             {
                 tcpPortPool.deallocate(allocNr);
             }
+            // undoing a deallocation means re-allocating the number - best effort, it might have been blocked meanwhile
             for (Integer deallocNr : deallocatedNumbers)
             {
-                tcpPortPool.deallocate(deallocNr);
+                tcpPortPool.tryAllocate(deallocNr);
             }
             throw exc;
         }

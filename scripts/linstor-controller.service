@@ -16,6 +16,8 @@ SuccessExitStatus=0 143 129
 DynamicUser=true
 User=linstor-controller
 Group=linstor
+# currently the controller collects the output of journalctl, add ourselves to systemd-journal
+SupplementaryGroups=systemd-journal
 ConfigurationDirectory=linstor
 # we can not use StateDirectory or LogsDirectory
 # these want to create dirs in /var/lib/private/<name> and symlink to them from /var/lib/<name>

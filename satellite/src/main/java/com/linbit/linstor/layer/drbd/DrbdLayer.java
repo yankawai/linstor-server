@@ -49,6 +49,7 @@ import com.linbit.linstor.layer.drbd.drbdstate.DrbdVolume;
 import com.linbit.linstor.layer.drbd.drbdstate.NoInitialStateException;
 import com.linbit.linstor.layer.drbd.drbdstate.ResourceObserver;
 import com.linbit.linstor.layer.drbd.helper.ReadyForPrimaryNotifier;
+import com.linbit.linstor.layer.drbd.resfiles.ConfFileBuilder;
 import com.linbit.linstor.layer.drbd.resfiles.DrbdResourceFileUtils;
 import com.linbit.linstor.layer.drbd.utils.DrbdAdm;
 import com.linbit.linstor.layer.drbd.utils.DrbdGiStringBuilder;
@@ -81,6 +82,7 @@ import javax.inject.Provider;
 import javax.inject.Singleton;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -898,7 +900,7 @@ public class DrbdLayer implements DeviceLayer
                         // we might want to change this in the future, especially as soon as the user
                         // can somehow trigger changing ports, where the DRBD resource will most likely
                         // be up and running but the new port might still be blocked by something else
-                        checkBlockedPorts(drbdRscData);
+                        checkBlockedPorts(workerCtx, drbdRscData);
                     }
                     try
                     {
@@ -2123,16 +2125,46 @@ public class DrbdLayer implements DeviceLayer
         }
     }
 
-    private void checkBlockedPorts(DrbdRscData<Resource> drbdRscDataRef) throws BlockedPortsException
+    private void checkBlockedPorts(AccessContext aCtx, DrbdRscData<Resource> drbdRscDataRef)
+        throws AccessDeniedException, BlockedPortsException, StorageException
     {
-        // we pass null as IP (aka 0.0.0.0) here due to 2 reasons:
-        // 1) we would need to determine here all the IP/Port combinations to each of our peers which involves
-        // checking PrefNic, Node-/Rsc-Connections, etc.. (complicated + cumbersome. would require extracting
-        // methods of the reworked ConfFileBuilder for path-mesh)
-        // 2) the controller (currently) only has 1 list of blocked ports, not one per IP / NetIf. It does not
-        // really make sense to check only for a given IP but then tell the controller this nodes (not netIfs)
-        // port is blocked (aka "globally" on this node).
-        List<Integer> blockedPorts = TcpPortUtils.getBlockedPortsAsIntList(null, drbdRscDataRef.getTcpPortList());
+        // check the ports on the local IP addresses DRBD will actually bind to (resolved by the same logic as the
+        // res file generation, i.e. connection paths, PrefNic, etc.). Briefly binding 0.0.0.0 instead is not
+        // reliable on all platforms: on Windows a wildcard bind does not conflict with a socket already listening
+        // on a specific address, so blocked ports would go undetected there.
+        //
+        // the controller (currently) only has 1 list of blocked ports, not one per IP / NetIf. Therefore a port
+        // that is blocked on any of the local bind addresses is reported as blocked on this node.
+        Set<InetAddress> bindAddrs = ConfFileBuilder.getLocalBindAddresses(
+            aCtx,
+            drbdRscDataRef,
+            DrbdResourceFileUtils.getPeerRscDataList(aCtx, drbdRscDataRef),
+            stltCfgAccessor.getReadonlyProps(),
+            errorReporter
+        );
+        Iterator<InetAddress> bindAddrsIt = bindAddrs.iterator();
+        while (bindAddrsIt.hasNext())
+        {
+            InetAddress bindAddr = bindAddrsIt.next();
+            if (!TcpPortUtils.isIpAddressLocallyAssigned(bindAddr))
+            {
+                // binding this IP fails regardless of the chosen port, so reporting its ports as blocked would
+                // only cause pointless port repicking. DRBD will run into its own, more descriptive error instead
+                errorReporter.logWarning(
+                    "DrbdLayer: IP address %s of resource %s is not assigned on this node. Skipping port " +
+                        "availability check for this address.",
+                    bindAddr.getHostAddress(),
+                    drbdRscDataRef.getSuffixedResourceName()
+                );
+                bindAddrsIt.remove();
+            }
+        }
+        // if no bind address could be determined, getBlockedPortsAsIntList falls back to checking on 0.0.0.0
+        List<Integer> blockedPorts = TcpPortUtils.getBlockedPortsAsIntList(
+            errorReporter,
+            bindAddrs,
+            drbdRscDataRef.getTcpPortList()
+        );
         if (!blockedPorts.isEmpty())
         {
             errorReporter.logWarning(

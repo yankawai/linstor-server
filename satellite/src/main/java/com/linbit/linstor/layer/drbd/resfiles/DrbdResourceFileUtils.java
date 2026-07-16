@@ -74,17 +74,7 @@ public class DrbdResourceFileUtils
         Path resFile = asResourceFile(drbdRscData, false, false);
         Path tmpResFile = asResourceFile(drbdRscData, true, false);
 
-        List<DrbdRscData<Resource>> drbdPeerRscDataList = drbdRscData.getRscDfnLayerObject()
-            .getDrbdRscDataList()
-            .stream()
-            .filter(
-                otherRscData -> !otherRscData.equals(drbdRscData) &&
-                    AccessUtils.execPrivileged(() -> DrbdLayerUtils.isDrbdResourceExpected(workerCtx, otherRscData)) &&
-                    AccessUtils.execPrivileged(
-                        () -> !otherRscData.getAbsResource().getStateFlags().isSet(workerCtx, Resource.Flags.INACTIVE)
-                    )
-            )
-            .collect(Collectors.toList());
+        List<DrbdRscData<Resource>> drbdPeerRscDataList = getPeerRscDataList(workerCtx, drbdRscData);
 
         String content = new ConfFileBuilder(
             errorReporter,
@@ -169,6 +159,25 @@ public class DrbdResourceFileUtils
             errorReporter.logInfo("DRBD regenerated resource file: %s", resFile);
         }
         return fileWritten;
+    }
+
+    /**
+     * Returns the list of peer {@link DrbdRscData} the given local resource is expected to connect to, i.e. the
+     * peers that are also considered during res file generation.
+     */
+    public static List<DrbdRscData<Resource>> getPeerRscDataList(AccessContext aCtx, DrbdRscData<Resource> drbdRscData)
+    {
+        return drbdRscData.getRscDfnLayerObject()
+            .getDrbdRscDataList()
+            .stream()
+            .filter(
+                otherRscData -> !otherRscData.equals(drbdRscData) &&
+                    AccessUtils.execPrivileged(() -> DrbdLayerUtils.isDrbdResourceExpected(aCtx, otherRscData)) &&
+                    AccessUtils.execPrivileged(
+                        () -> !otherRscData.getAbsResource().getStateFlags().isSet(aCtx, Resource.Flags.INACTIVE)
+                    )
+            )
+            .collect(Collectors.toList());
     }
 
     public boolean restoreBackupResFile(DrbdRscData<Resource> drbdRscData) throws StorageException

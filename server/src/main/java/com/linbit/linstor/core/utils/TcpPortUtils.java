@@ -2,12 +2,17 @@ package com.linbit.linstor.core.utils;
 
 import com.linbit.linstor.annotation.Nullable;
 import com.linbit.linstor.core.types.TcpPortNumber;
+import com.linbit.linstor.logging.ErrorReporter;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
 import java.net.ServerSocket;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 
 public class TcpPortUtils
@@ -17,22 +22,40 @@ public class TcpPortUtils
     }
 
     /**
-     * Returns a possibly empty list of ports that are currently blocked as int. {@code null} as {@code ipAddr} will be
-     * interpreted as 0.0.0.0
+     * Returns a possibly empty list of ports that could not be bound on at least one of the given IPs as int.
+     * {@code null} or an empty collection as {@code ipAddrsRef} will check on 0.0.0.0 (wildcard) instead.
      */
     public static List<Integer> getBlockedPortsAsIntList(
-        @Nullable InetAddress ipAddr,
-        @Nullable Collection<TcpPortNumber> collectionRef
+        @Nullable ErrorReporter errorReporterRef,
+        @Nullable Collection<InetAddress> ipAddrsRef,
+        @Nullable Collection<TcpPortNumber> portsRef
     )
     {
         List<Integer> ret = new ArrayList<>();
-        if (collectionRef != null)
+        if (portsRef != null)
         {
-            for (TcpPortNumber port : collectionRef)
+            Collection<InetAddress> ipAddrs = ipAddrsRef == null || ipAddrsRef.isEmpty() ?
+                Collections.singletonList(null) :
+                ipAddrsRef;
+            for (TcpPortNumber port : portsRef)
             {
-                if (!isTcpPortAvailable(ipAddr, port))
+                for (InetAddress ipAddr : ipAddrs)
                 {
-                    ret.add(port.value);
+                    IOException bindExc = tryTcpBind(ipAddr, port.value);
+                    if (bindExc != null)
+                    {
+                        if (errorReporterRef != null)
+                        {
+                            errorReporterRef.logDebug(
+                                "TCP port %d cannot be bound on %s: %s",
+                                port.value,
+                                ipAddr == null ? "0.0.0.0" : ipAddr.getHostAddress(),
+                                bindExc.getMessage()
+                            );
+                        }
+                        ret.add(port.value);
+                        break;
+                    }
                 }
             }
         }
@@ -54,15 +77,47 @@ public class TcpPortUtils
      */
     public static boolean isTcpPortAvailable(@Nullable InetAddress ipAddr, int port)
     {
-        boolean portAvailable = false;
-        try (ServerSocket ss = new ServerSocket(port))
+        return tryTcpBind(ipAddr, port) == null;
+    }
+
+    /**
+     * Tries to briefly bind a TCP server socket to the given IP + port. Returns {@code null} if the bind succeeded,
+     * the causing {@link IOException} otherwise. {@code null} as an IP will be interpreted as 0.0.0.0.
+     * <p>
+     * SO_REUSEADDR is enabled before binding so that sockets in TIME_WAIT state do not cause a port to be considered
+     * blocked. Note that on Windows the JDK binds in exclusive mode (SO_EXCLUSIVEADDRUSE) and only emulates
+     * SO_REUSEADDR, which means that ports with TIME_WAIT remnants are still reported as blocked there.
+     */
+    public static @Nullable IOException tryTcpBind(@Nullable InetAddress ipAddr, int port)
+    {
+        IOException ret = null;
+        try (ServerSocket ss = new ServerSocket())
         {
             ss.setReuseAddress(true);
-            portAvailable = true;
+            ss.bind(new InetSocketAddress(ipAddr, port));
         }
-        catch (IOException ignored)
+        catch (IOException exc)
+        {
+            ret = exc;
+        }
+        return ret;
+    }
+
+    /**
+     * Returns true if the given IP address is currently assigned to one of the local network interfaces. Binding an
+     * address that is not assigned locally fails regardless of the chosen port, i.e. such a failure must not be
+     * interpreted as "port blocked".
+     */
+    public static boolean isIpAddressLocallyAssigned(InetAddress ipAddr)
+    {
+        boolean assigned = false;
+        try
+        {
+            assigned = NetworkInterface.getByInetAddress(ipAddr) != null;
+        }
+        catch (SocketException ignored)
         {
         }
-        return portAvailable;
+        return assigned;
     }
 }

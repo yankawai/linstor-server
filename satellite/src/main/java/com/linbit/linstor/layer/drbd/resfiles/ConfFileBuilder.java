@@ -48,6 +48,8 @@ import com.linbit.utils.PairNonNull;
 import com.linbit.utils.StringUtils;
 import com.linbit.utils.TimeUtils;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -319,10 +321,9 @@ public class ConfFileBuilder
                     appendLine("connection");
                     try (Section connectionSection = new Section())
                     {
-                        List<PairNonNull<NetInterface, NetInterface>> pathsList = new ArrayList<>();
                         NodeConnection nodeConn = localRsc.getNode().getNodeConnection(accCtx, peerRsc.getNode());
                         @Nullable ResourceConnection rscConn = localRsc.getAbsResourceConnection(accCtx, peerRsc);
-                        @Nullable ReadOnlyProps paths = null;
+                        @Nullable ReadOnlyProps paths = getPathsNamespace(accCtx, localRsc, peerRsc);
 
                         PriorityProps prioPropsConn = new PriorityProps();
                         if (rscConn != null)
@@ -371,9 +372,7 @@ public class ConfFileBuilder
 
                         if (rscConn != null)
                         {
-                            // get paths from resource connection...
                             ReadOnlyProps rscConnProps = rscConn.getProps(accCtx);
-                            paths = rscConnProps.getNamespace(ApiConsts.NAMESPC_CONNECTION_PATHS);
 
                             PriorityProps prioRscConnProps = new PriorityProps()
                                 .addProps(
@@ -436,91 +435,14 @@ public class ConfFileBuilder
                             }
                         }
 
-                        // ...or fall back to node connection
-                        if (paths == null && nodeConn != null)
-                        {
-                            paths = nodeConn.getProps(accCtx).getNamespace(ApiConsts.NAMESPC_CONNECTION_PATHS);
-                        }
-
-
                         if (paths != null)
                         {
-                            // iterate through network connection paths
-                            Iterator<String> pathsIterator = paths.iterateNamespaces();
-                            while (pathsIterator.hasNext())
-                            {
-                                String path = pathsIterator.next();
-                                ReadOnlyProps ncEntryNamespace = paths.getNamespace(path);
-
-                                if (ncEntryNamespace != null && ncEntryNamespace.map().size() == 2)
-                                {
-                                    Node firstNode = peerRsc.getNode();
-                                    Node secondNode = localRsc.getNode();
-                                    try
-                                    {
-                                        // iterate through nodes (should be exactly 2)
-                                        Iterator<String> nodesIterator = ncEntryNamespace.keysIterator();
-                                        String firstNodeName = StringUtils.split(nodesIterator.next(), "/")[2];
-                                        String secondNodeName = StringUtils.split(nodesIterator.next(), "/")[2];
-
-                                        // keep order of nodes correct
-                                        if (firstNode.getName().value.equalsIgnoreCase(secondNodeName) &&
-                                            secondNode.getName().value.equalsIgnoreCase(firstNodeName))
-                                        {
-                                            Node temp = firstNode;
-                                            firstNode = secondNode;
-                                            secondNode = temp;
-                                        }
-                                        else
-                                        if (!(firstNode.getName().value.equalsIgnoreCase(firstNodeName) &&
-                                                secondNode.getName().value.equalsIgnoreCase(secondNodeName)))
-                                        {
-                                            throw new ImplementationError(
-                                                "Configured node names " + firstNodeName + " and " +
-                                                secondNodeName + " do not match the actual node names."
-                                            );
-                                        }
-
-                                        // get corresponding network interfaces
-                                        String nicName = ncEntryNamespace.getProp(firstNodeName);
-                                        NetInterface firstNic = firstNode.getNetInterface(
-                                                accCtx, new NetInterfaceName(nicName));
-
-                                        if (firstNic == null)
-                                        {
-                                            throw new StorageException("Network interface '" + nicName +
-                                                "' of node '" + firstNode + "' does not exist!");
-                                        }
-
-                                        nicName = ncEntryNamespace.getProp(secondNodeName);
-                                        NetInterface secondNic = secondNode.getNetInterface(
-                                            accCtx, new NetInterfaceName(nicName));
-
-                                        if (secondNic == null)
-                                        {
-                                            throw new StorageException("Network interface '" + nicName +
-                                                "' of node '" + secondNode + "' does not exist!");
-                                        }
-
-                                        pathsList.add(new PairNonNull<>(firstNic, secondNic));
-                                    }
-                                    catch (InvalidKeyException exc)
-                                    {
-                                        throw new ImplementationError(
-                                            "No network interface configured!", exc);
-                                    }
-                                    catch (InvalidNameException exc)
-                                    {
-                                        throw new StorageException(
-                                            "Name format of for network interface is not valid!", exc);
-                                    }
-                                }
-                                else
-                                {
-                                    throw new ImplementationError(
-                                        "When configuring a path it must contain exactly two nodes!");
-                                }
-                            }
+                            List<PairNonNull<NetInterface, NetInterface>> pathsList = parseConnectionPaths(
+                                accCtx,
+                                paths,
+                                localRsc,
+                                peerRsc
+                            );
 
                             // add network connection paths...
                             for (PairNonNull<NetInterface, NetInterface> path : pathsList)
@@ -572,13 +494,13 @@ public class ConfFileBuilder
                             appendConnectionHost(
                                 localPort,
                                 rscConn,
-                                getPreferredNetIf(localRscData),
+                                getPreferredNetIf(accCtx, localRscData, stltProps, errorReporter),
                                 getOutsideNetIf(localRscData)
                             );
                             appendConnectionHost(
                                 peerPort,
                                 rscConn,
-                                getPreferredNetIf(peerRscData),
+                                getPreferredNetIf(accCtx, peerRscData, stltProps, errorReporter),
                                 getOutsideNetIf(peerRscData)
                             );
                         }
@@ -845,7 +767,212 @@ public class ConfFileBuilder
         }
     }
 
-    private NetInterface getPreferredNetIf(DrbdRscData<Resource> peerRscDataRef)
+    /**
+     * Returns the namespace containing the configured connection paths between the two given resources, taken from
+     * the resource connection or, if the resource connection has no paths configured, from the node connection.
+     * Returns {@code null} if neither has configured paths.
+     */
+    public static @Nullable ReadOnlyProps getPathsNamespace(AccessContext aCtx, Resource localRsc, Resource peerRsc)
+        throws AccessDeniedException
+    {
+        @Nullable ReadOnlyProps paths = null;
+        @Nullable ResourceConnection rscConn = localRsc.getAbsResourceConnection(aCtx, peerRsc);
+        if (rscConn != null)
+        {
+            // get paths from resource connection...
+            paths = rscConn.getProps(aCtx).getNamespace(ApiConsts.NAMESPC_CONNECTION_PATHS);
+        }
+        if (paths == null)
+        {
+            // ...or fall back to node connection
+            NodeConnection nodeConn = localRsc.getNode().getNodeConnection(aCtx, peerRsc.getNode());
+            if (nodeConn != null)
+            {
+                paths = nodeConn.getProps(aCtx).getNamespace(ApiConsts.NAMESPC_CONNECTION_PATHS);
+            }
+        }
+        return paths;
+    }
+
+    /**
+     * Parses the given connection paths namespace (see {@link #getPathsNamespace(AccessContext, Resource, Resource)})
+     * into pairs of
+     * {@link NetInterface}s. The order within a pair is not defined, i.e. either side of a pair might belong to the
+     * local node.
+     */
+    public static List<PairNonNull<NetInterface, NetInterface>> parseConnectionPaths(
+        AccessContext aCtx,
+        ReadOnlyProps pathsRef,
+        Resource localRsc,
+        Resource peerRsc
+    )
+        throws AccessDeniedException, StorageException
+    {
+        List<PairNonNull<NetInterface, NetInterface>> pathsList = new ArrayList<>();
+
+        // iterate through network connection paths
+        Iterator<String> pathsIterator = pathsRef.iterateNamespaces();
+        while (pathsIterator.hasNext())
+        {
+            String path = pathsIterator.next();
+            ReadOnlyProps ncEntryNamespace = pathsRef.getNamespace(path);
+
+            if (ncEntryNamespace != null && ncEntryNamespace.map().size() == 2)
+            {
+                Node firstNode = peerRsc.getNode();
+                Node secondNode = localRsc.getNode();
+                try
+                {
+                    // iterate through nodes (should be exactly 2)
+                    Iterator<String> nodesIterator = ncEntryNamespace.keysIterator();
+                    String firstNodeName = StringUtils.split(nodesIterator.next(), "/")[2];
+                    String secondNodeName = StringUtils.split(nodesIterator.next(), "/")[2];
+
+                    // keep order of nodes correct
+                    if (firstNode.getName().value.equalsIgnoreCase(secondNodeName) &&
+                        secondNode.getName().value.equalsIgnoreCase(firstNodeName))
+                    {
+                        Node temp = firstNode;
+                        firstNode = secondNode;
+                        secondNode = temp;
+                    }
+                    else
+                    if (!(firstNode.getName().value.equalsIgnoreCase(firstNodeName) &&
+                            secondNode.getName().value.equalsIgnoreCase(secondNodeName)))
+                    {
+                        throw new ImplementationError(
+                            "Configured node names " + firstNodeName + " and " +
+                            secondNodeName + " do not match the actual node names."
+                        );
+                    }
+
+                    // get corresponding network interfaces
+                    String nicName = ncEntryNamespace.getProp(firstNodeName);
+                    NetInterface firstNic = firstNode.getNetInterface(aCtx, new NetInterfaceName(nicName));
+
+                    if (firstNic == null)
+                    {
+                        throw new StorageException("Network interface '" + nicName +
+                            "' of node '" + firstNode + "' does not exist!");
+                    }
+
+                    nicName = ncEntryNamespace.getProp(secondNodeName);
+                    NetInterface secondNic = secondNode.getNetInterface(aCtx, new NetInterfaceName(nicName));
+
+                    if (secondNic == null)
+                    {
+                        throw new StorageException("Network interface '" + nicName +
+                            "' of node '" + secondNode + "' does not exist!");
+                    }
+
+                    pathsList.add(new PairNonNull<>(firstNic, secondNic));
+                }
+                catch (InvalidKeyException exc)
+                {
+                    throw new ImplementationError(
+                        "No network interface configured!", exc);
+                }
+                catch (InvalidNameException exc)
+                {
+                    throw new StorageException(
+                        "Name format of for network interface is not valid!", exc);
+                }
+            }
+            else
+            {
+                throw new ImplementationError(
+                    "When configuring a path it must contain exactly two nodes!");
+            }
+        }
+
+        return pathsList;
+    }
+
+    /**
+     * Returns the set of local IP addresses the local DRBD resource will bind its listeners to, using the same
+     * NetInterface resolution as the res file generation: configured connection paths per peer, with the
+     * PrefNic based lookup as fallback. For connections using a local DRBD proxy, DRBD itself binds to loopback
+     * addresses instead.
+     */
+    public static Set<InetAddress> getLocalBindAddresses(
+        AccessContext aCtx,
+        DrbdRscData<Resource> localRscDataRef,
+        Collection<DrbdRscData<Resource>> peerRscDataListRef,
+        ReadOnlyProps stltPropsRef,
+        ErrorReporter errorReporterRef
+    )
+        throws AccessDeniedException, StorageException
+    {
+        Set<InetAddress> bindAddrs = new LinkedHashSet<>();
+        Resource localRsc = localRscDataRef.getAbsResource();
+        Node localNode = localRsc.getNode();
+
+        boolean usePreferredNetIf = false;
+        for (DrbdRscData<Resource> peerRscData : peerRscDataListRef)
+        {
+            Resource peerRsc = peerRscData.getAbsResource();
+            // same conditions as the res file generation uses for creating connection sections
+            if (
+                peerRsc.getStateFlags().isUnset(aCtx, Resource.Flags.DELETE) &&
+                    !(peerRsc.disklessForDrbdPeers(aCtx) &&
+                        localRsc.getStateFlags().isSet(aCtx, Resource.Flags.DRBD_DISKLESS))
+            )
+            {
+                @Nullable ResourceConnection rscConn = localRsc.getAbsResourceConnection(aCtx, peerRsc);
+                if (rscConn != null && rscConn.getStateFlags().isSet(aCtx, ResourceConnection.Flags.LOCAL_DRBD_PROXY))
+                {
+                    // DRBD itself binds to 127.0.0.1, the proxy binds 127.0.0.2 (inside) as well as the
+                    // NetIf resolved below (outside), all on the same port
+                    addIpAddress(bindAddrs, "127.0.0.1", errorReporterRef);
+                    addIpAddress(bindAddrs, "127.0.0.2", errorReporterRef);
+                }
+                @Nullable ReadOnlyProps paths = getPathsNamespace(aCtx, localRsc, peerRsc);
+                if (paths != null)
+                {
+                    for (PairNonNull<NetInterface, NetInterface> path : parseConnectionPaths(
+                            aCtx, paths, localRsc, peerRsc))
+                    {
+                        NetInterface localNetIf = path.objA.getNode().equals(localNode) ? path.objA : path.objB;
+                        addIpAddress(bindAddrs, localNetIf.getAddress(aCtx).getAddress(), errorReporterRef);
+                    }
+                }
+                else
+                {
+                    usePreferredNetIf = true;
+                }
+            }
+        }
+        if (usePreferredNetIf || bindAddrs.isEmpty())
+        {
+            @Nullable NetInterface preferredNetIf = getPreferredNetIf(
+                aCtx, localRscDataRef, stltPropsRef, errorReporterRef);
+            if (preferredNetIf != null)
+            {
+                addIpAddress(bindAddrs, preferredNetIf.getAddress(aCtx).getAddress(), errorReporterRef);
+            }
+        }
+        return bindAddrs;
+    }
+
+    private static void addIpAddress(Set<InetAddress> bindAddrsRef, String ipAddrRef, ErrorReporter errorReporterRef)
+    {
+        try
+        {
+            bindAddrsRef.add(InetAddress.getByName(ipAddrRef));
+        }
+        catch (UnknownHostException exc)
+        {
+            // cannot happen with a valid IP literal, but just in case
+            errorReporterRef.logWarning("Failed to parse IP address '%s', skipping", ipAddrRef);
+        }
+    }
+
+    private static @Nullable NetInterface getPreferredNetIf(
+        AccessContext accCtx,
+        DrbdRscData<Resource> peerRscDataRef,
+        ReadOnlyProps stltPropsRef,
+        ErrorReporter errorReporterRef
+    )
     {
         @Nullable NetInterface preferredNetIf = null;
         try
@@ -865,7 +992,7 @@ public class ConfFileBuilder
             prioProps.addProps(rsc.getResourceDefinition().getProps(accCtx));
             prioProps.addProps(rsc.getResourceDefinition().getResourceGroup().getProps(accCtx));
             prioProps.addProps(node.getProps(accCtx));
-            prioProps.addProps(stltProps);
+            prioProps.addProps(stltPropsRef);
 
             String prefNic = prioProps.getProp(ApiConsts.KEY_STOR_POOL_PREF_NIC);
 
@@ -878,7 +1005,7 @@ public class ConfFileBuilder
 
                 if (preferredNetIf == null)
                 {
-                    errorReporter.logWarning(
+                    errorReporterRef.logWarning(
                         String.format("Preferred network interface '%s' not found, fallback to default", prefNic)
                     );
                 }
@@ -954,7 +1081,7 @@ public class ConfFileBuilder
         return ret;
     }
 
-    private LinkedHashSet<StorPool> getStorPools(DrbdRscData<Resource> peerRscDataRef)
+    private static LinkedHashSet<StorPool> getStorPools(DrbdRscData<Resource> peerRscDataRef)
         throws AccessDeniedException
     {
         LinkedHashSet<StorPool> ret = new LinkedHashSet<>();

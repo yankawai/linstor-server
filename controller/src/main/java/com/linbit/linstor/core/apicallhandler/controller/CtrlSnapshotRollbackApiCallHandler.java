@@ -138,6 +138,7 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
     private final CtrlRscMakeAvailableApiCallHandler ctrlRscMakeAvailableApiCallHandler;
     private final CtrlVlmDfnCrtApiHelper ctrlVlmDfnCrtApiHelper;
     private final ZfsChecks zfsChecks;
+    private final CtrlRscCrtApiHelper ctrlRscCrtApiHelper;
 
     @Inject
     public CtrlSnapshotRollbackApiCallHandler(
@@ -161,7 +162,8 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
         CtrlSnapshotCrtHelper ctrlSnapCrtHelperRef,
         CtrlRscMakeAvailableApiCallHandler ctrlRscMakeAvailableApiCallHandlerRef,
         CtrlVlmDfnCrtApiHelper ctrlVlmDfnCrtApiHelperRef,
-        ZfsChecks zfsChecksRef
+        ZfsChecks zfsChecksRef,
+        CtrlRscCrtApiHelper ctrlRscCrtApiHelperRef
     )
     {
         apiCtx = apiCtxRef;
@@ -185,28 +187,30 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
         ctrlRscMakeAvailableApiCallHandler = ctrlRscMakeAvailableApiCallHandlerRef;
         ctrlVlmDfnCrtApiHelper = ctrlVlmDfnCrtApiHelperRef;
         zfsChecks = zfsChecksRef;
+        ctrlRscCrtApiHelper = ctrlRscCrtApiHelperRef;
     }
 
     @Override
     public Collection<Flux<ApiCallRc>> resourceDefinitionConnected(ResourceDefinition rscDfn, ResponseContext context)
         throws AccessDeniedException
     {
-        boolean anyNodeRollbackPending = false;
+        @Nullable String rollbackTargetSnapName = null;
 
         Iterator<Resource> rscIter = rscDfn.iterateResource(apiCtx);
         while (rscIter.hasNext())
         {
             Resource rsc = rscIter.next();
-            if (rsc.getProps(apiCtx).map().get(ApiConsts.KEY_RSC_ROLLBACK_TARGET) != null)
+            @Nullable String snapNameStr = rsc.getProps(apiCtx).map().get(ApiConsts.KEY_RSC_ROLLBACK_TARGET);
+            if (snapNameStr != null)
             {
-                anyNodeRollbackPending = true;
+                rollbackTargetSnapName = snapNameStr;
             }
         }
 
         List<Flux<ApiCallRc>> fluxes = new ArrayList<>();
-        if (anyNodeRollbackPending)
+        if (rollbackTargetSnapName != null)
         {
-            fluxes.add(updateForRollback(rscDfn.getName()));
+            fluxes.add(updateForRollback(rscDfn.getName(), rollbackTargetSnapName));
         }
 
         for (SnapshotDefinition snapshotDfn : rscDfn.getSnapshotDfns(apiCtx))
@@ -705,17 +709,17 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
     }
 
     // Restart from here when connection established and any ROLLBACK_TARGET flag set
-    private Flux<ApiCallRc> updateForRollback(ResourceName rscName)
+    private Flux<ApiCallRc> updateForRollback(ResourceName rscName, String snapNameStr)
     {
         return scopeRunner
             .fluxInTransactionlessScope(
                 "Update for rollback",
                 lockGuardFactory.buildDeferred(LockType.READ, LockObj.NODES_MAP, LockObj.RSC_DFN_MAP),
-                () -> updateForRollbackInScope(rscName)
+                () -> updateForRollbackInScope(rscName, snapNameStr)
             );
     }
 
-    private Flux<ApiCallRc> updateForRollbackInScope(ResourceName rscName)
+    private Flux<ApiCallRc> updateForRollbackInScope(ResourceName rscName, String snapNameStr)
     {
         ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscName, true);
 
@@ -732,7 +736,7 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
             }
         }
 
-        Flux<ApiCallRc> finishRollback = finishRollback(rscName);
+        Flux<ApiCallRc> finishRollback = finishRollback(rscName, snapNameStr);
         Flux<ApiCallRc> snapRollbackFlux = snapRollbackMgr.prepareFlux(rscDfn, diskNodeNames);
         var logContextMap = MDC.getCopyOfContextMap();
         return Flux.merge(
@@ -798,22 +802,39 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
         return Flux.empty();
     }
 
-    private Flux<ApiCallRc> finishRollback(ResourceName rscName)
+    private Flux<ApiCallRc> finishRollback(ResourceName rscName, String snapNameStr)
     {
         return scopeRunner
             .fluxInTransactionalScope(
                 "Reactivate resources after rollback",
                 lockGuardFactory.buildDeferred(LockType.READ, LockObj.NODES_MAP, LockObj.RSC_DFN_MAP),
-                () -> finishRollbackInScope(rscName)
+                () -> finishRollbackInScope(rscName, snapNameStr)
             );
     }
 
-    private Flux<ApiCallRc> finishRollbackInScope(ResourceName rscName)
+    private Flux<ApiCallRc> finishRollbackInScope(ResourceName rscName, String snapNameStr)
     {
         ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscName, true);
         unmarkDownPrivileged(rscDfn);
 
         ctrlTransactionHelper.commit();
+
+        Set<Resource> diskRscSet = new HashSet<>();
+        Iterator<Resource> rscIter = iterateResourcePrivileged(rscDfn);
+        while (rscIter.hasNext())
+        {
+            Resource rsc = rscIter.next();
+            if (!isDisklessPrivileged(rsc))
+            {
+                diskRscSet.add(rsc);
+            }
+        }
+        ResponseContext context = makeSnapshotContext(
+            ApiOperation.makeModifyOperation(),
+            Collections.emptyList(),
+            rscName.displayValue,
+            snapNameStr
+        );
 
         return ctrlSatelliteUpdateCaller.updateSatellites(rscDfn, Flux.empty())
             .transform(responses -> CtrlResponseUtils.combineResponses(
@@ -821,7 +842,10 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
                 responses,
                 rscName,
                 "Re-activated resource {1} on {0} after rollback"
-            ));
+            ))
+            // do not report the rollback as finished before the re-activated resources are
+            // actually ready again (same semantics as resource create / snapshot restore)
+            .concatWith(ctrlRscCrtApiHelper.waitResourcesReady(context, rscDfn, diskRscSet));
     }
 
     private void ensureNoBackupRestoreRunning(ResourceDefinition rscDfn)
@@ -1169,6 +1193,6 @@ public class CtrlSnapshotRollbackApiCallHandler implements CtrlSatelliteConnecti
             getProps(rsc).map().put(ApiConsts.KEY_RSC_ROLLBACK_TARGET, snapshotName.displayValue);
         }
         ctrlTransactionHelper.commit();
-        return updateForRollback(rscName);
+        return updateForRollback(rscName, snapshotName.displayValue);
     }
 }

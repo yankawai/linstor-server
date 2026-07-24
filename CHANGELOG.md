@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.2] - 2026-07-24
+
 ### Fixed
 
 - Fixed the `zfs rollback` snapshot rollback strategy reporting success as soon as the satellites confirmed the resource re-activation; it now waits for the rolled-back DRBD resources to actually become ready again, like resource creation and snapshot restore do

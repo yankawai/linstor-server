@@ -1,3 +1,23 @@
+linstor-server (1.34.2-1) experimental; urgency=medium
+
+  [ Rene Peinthor ]
+  * auto-verify-algo: update satellites when the algorithm changes
+  * Fix rsc-dfn staying marked down after ZFS-strategy snapshot rollback
+  * Fix zfs rollback strategy not waiting for resources to become ready
+
+  [ Roland Kammerer ]
+  * linstor-controller: allow execution of journalctl
+
+  [ Ryan Ronnander ]
+  * Drbd: fix proxy port target setter clobbering the source port
+  * Drbd: reallocate resource-connection proxy ports on startup
+  * Drbd: restore deallocated ports when setPorts fails
+
+  [ Gabor Hernadi ]
+  * DRBD: check blocked ports on the actual local bind addresses
+
+ -- Rene Peinthor <rene.peinthor@linbit.com>  Fri, 24 Jul 2026 10:16:47 +0000
+
 linstor-server (1.34.1-1) experimental; urgency=medium
 
   [ Moritz Tanner ]

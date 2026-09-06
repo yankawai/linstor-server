@@ -153,6 +153,8 @@ public abstract class AbsStorageProvider<
     }
 
     private static final long DFLT_WAIT_UNTIL_DEVICE_CREATED_TIMEOUT_IN_MS = 5000;
+    private static final int PROBE_VLM_ATTEMPTS = 3;
+    private static final long PROBE_VLM_RETRY_DELAY_IN_MS = 1000;
     protected static final int DFLT_STRIPES = 1;
     public static final long SIZE_OF_NOT_FOUND_STOR_POOL = ApiConsts.VAL_STOR_POOL_SPACE_NOT_FOUND;
 
@@ -173,6 +175,7 @@ public abstract class AbsStorageProvider<
     protected final Set<String> changedStoragePoolStrings = new HashSet<>();
     private final String typeDescr;
     private final FileSystemWatch fsWatch;
+    private final Object probeVlmLock = new Object();
     protected final DeviceProviderKind kind;
     private final DrbdInvalidateUtils drbdInvalidateUtils;
 
@@ -1860,8 +1863,8 @@ public abstract class AbsStorageProvider<
      * Updates block device information (min I/O size, optimal I/O size, discard granularity) for a storage pool.
      *
      * Examines the first volume that exists in the storage pool to determine the block device properties from sysfs.
-     * If no volumes exist, a temporary probe volume is created. The determined values are stored as storage pool
-     * properties and sent to the controller.
+     * If no usable device exists, a temporary probe volume is created where supported. The determined values are stored
+     * as storage pool properties and sent to the controller.
      *
      * @param storPoolObj The storage pool to operate on
      * @param propsChange A LocalPropsChangePojo object to use for sending the property update to the controller
@@ -1916,38 +1919,114 @@ public abstract class AbsStorageProvider<
                 {
                 }
             }
-            else if (CollectionUtils.isEmpty(vlmProviderList) && this instanceof ProbeVlmStorageProvider storPrv)
+            else if (this instanceof ProbeVlmStorageProvider storPrv)
             {
-                errorReporter.logDebug("updateBlockDeviceInfo: Don't have vlmProviderList, using temporary volumes");
-                try
-                {
-                    final @Nullable String storDevicePath = storPrv.createTmpProbeVlm(storPoolObj);
-                    try
-                    {
-                        updateBlockDeviceInfoByDevice(storPoolObj, storDevicePath, propsChange);
-                    }
-                    catch (IOException ignored)
-                    {
-                    }
-                }
-                catch (StorageException ignored)
-                {
-                    errorReporter.logDebug("updateBlockDeviceInfo: Temporary volume creation failed");
-                }
-                finally
-                {
-                    try
-                    {
-                        storPrv.deleteTmpProbeVlm(storPoolObj);
-                    }
-                    catch (StorageException ignored)
-                    {
-                        errorReporter.logDebug("updateBlockDeviceInfo: Temporary volume deletion failed");
-                    }
-                }
+                updateBlockDeviceInfoByProbeVlm(storPrv, storPoolObj, propsChange);
             }
         }
         errorReporter.logDebug("EXIT updateBlockDeviceInfo method");
+    }
+
+    private void updateBlockDeviceInfoByProbeVlm(
+        ProbeVlmStorageProvider storPrv,
+        StorPool storPoolObj,
+        LocalPropsChangePojo propsChange
+    )
+    {
+        // Providers use a fixed probe name. Keep creation, probing and cleanup in one critical section.
+        synchronized (probeVlmLock)
+        {
+            boolean haveInfo = false;
+            boolean interrupted = false;
+            String lastFailure = "";
+            int attempts = 0;
+            while (attempts < PROBE_VLM_ATTEMPTS && !haveInfo && !interrupted)
+            {
+                if (attempts > 0)
+                {
+                    try
+                    {
+                        Thread.sleep(PROBE_VLM_RETRY_DELAY_IN_MS);
+                    }
+                    catch (InterruptedException exc)
+                    {
+                        Thread.currentThread().interrupt();
+                        lastFailure = "interrupted before the next probe attempt";
+                        break;
+                    }
+                }
+                attempts++;
+                boolean created = false;
+                boolean cleaned = false;
+                try
+                {
+                    @Nullable String storDevicePath = storPrv.createTmpProbeVlm(storPoolObj);
+                    created = true;
+                    if (storDevicePath == null)
+                    {
+                        lastFailure = "temporary volume has no device path";
+                    }
+                    else
+                    {
+                        waitUntilDeviceCreated(storDevicePath, getWaitTimeoutAfterCreate(storPoolObj));
+                        updateBlockDeviceInfoByDevice(storPoolObj, storDevicePath, propsChange);
+                        haveInfo = true;
+                    }
+                }
+                catch (StorageException | IOException exc)
+                {
+                    lastFailure = exc.getMessage();
+                    interrupted = exc.getCause() instanceof InterruptedException ||
+                        Thread.currentThread().isInterrupted();
+                    errorReporter.logDebug(
+                        "Temporary volume %s attempt %d failed: %s",
+                        created ? "probe" : "creation",
+                        attempts,
+                        lastFailure
+                    );
+                }
+                finally
+                {
+                    // Only a volume that was actually created can and must be cleaned up; after a failed
+                    // creation there is nothing to delete and no point in further attempts.
+                    if (created)
+                    {
+                        try
+                        {
+                            storPrv.deleteTmpProbeVlm(storPoolObj);
+                            cleaned = true;
+                        }
+                        catch (StorageException exc)
+                        {
+                            interrupted |= exc.getCause() instanceof InterruptedException ||
+                                Thread.currentThread().isInterrupted();
+                            errorReporter.logWarning(
+                                "Failed to delete temporary probe volume for storage pool '%s': %s",
+                                storPoolObj.getName().displayValue,
+                                exc.getMessage()
+                            );
+                        }
+                    }
+                }
+                if (interrupted)
+                {
+                    Thread.currentThread().interrupt();
+                }
+                if (!created || !cleaned)
+                {
+                    break;
+                }
+            }
+            if (!haveInfo)
+            {
+                errorReporter.logWarning(
+                    "Could not determine block device information for storage pool '%s' after %d probe attempts: %s",
+                    storPoolObj.getName().displayValue,
+                    attempts,
+                    lastFailure
+                );
+            }
+        }
     }
 
     /**

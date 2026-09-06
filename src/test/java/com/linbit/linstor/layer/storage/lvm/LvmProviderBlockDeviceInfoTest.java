@@ -24,10 +24,13 @@ import com.linbit.linstor.storage.StorageConstants;
 import com.linbit.linstor.storage.kinds.DeviceLayerKind;
 import com.linbit.linstor.storage.kinds.DeviceProviderKind;
 
+import java.nio.file.Path;
 import java.util.Collections;
 
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.mockito.Mockito;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,6 +58,9 @@ public class LvmProviderBlockDeviceInfoTest extends GenericDbBase
 
     private TestExtCmd extCmd;
     private AbsStorageProviderInit providerInit;
+
+    @Rule
+    public final TemporaryFolder temporaryFolder = new TemporaryFolder();
 
     /** Unique per test method since LvmUtils caches the lvm filter config statically per volume group set */
     private String vg;
@@ -130,7 +136,16 @@ public class LvmProviderBlockDeviceInfoTest extends GenericDbBase
     @Test
     public void thinPoolWithoutVolumesProbesWithTemporaryVolume() throws Exception
     {
-        LvmThinProvider lvmThinProvider = new LvmThinProvider(providerInit);
+        // TestExtCmd simulates lvcreate; use a real file for the resulting device path.
+        Path probeDevice = temporaryFolder.newFile("probe").toPath();
+        LvmThinProvider lvmThinProvider = new LvmThinProvider(providerInit)
+        {
+            @Override
+            public String getDevicePath(String storageNameRef, String lvIdRef)
+            {
+                return probeDevice.toString();
+            }
+        };
         StorPool storPool = createStorPool(DeviceProviderKind.LVM_THIN);
 
         expect(pvDisplayCommand(), "  " + PV_DEV + "\n");
